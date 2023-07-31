@@ -9,11 +9,269 @@ function learn.gaussian(mean, sd)
   return math.sqrt(-2 * math.log(math.random())) * math.cos(2 * math.pi * math.random()) * sd + mean
 end
 
-require("learn/tensor")
-require("learn/model")
-require("learn/layer")
-require("learn/transfer")
-require("learn/criterion")
+-- Transfer function module, simply applies the function
+function learn.transfer.transfer(p)
+  function p.forward(input)
+    p.output = input.copy().map(p.transfer)
+    return p.output
+  end
+
+  function p.backward(input, gradients)
+    return p.output.copy().map(p.derivative), gradients
+  end
+
+  function p.update(input)
+    return p.output
+  end
+
+  return p
+end
+
+-- The sigmoid transfer function in the form of a module
+function learn.transfer.sigmoid(p)
+  p = learn.transfer.transfer(p)
+  function p.transfer(x) return 1 / (1 + math.exp(-x)) end
+  function p.derivative(x) return x * (1 - x) end
+  return p
+end
+
+-- The hyperbolic tangent transfer function in the form of a module
+function learn.transfer.tanh(p)
+  p = learn.transfer.transfer(p)
+  function p.transfer(x)
+    local ex, enx = math.exp(x), math.exp(-x)
+    return (ex - enx) / (ex + enx)
+  end
+  function p.derivative(x)
+    local e2x = math.exp(2.0 * x)
+    return 4 * e2x / math.pow(e2x + 1, 2.0)
+  end
+  return p
+end
+
+-- Applies the rectified linear unit function
+function learn.transfer.relu(p)
+  p = learn.transfer.transfer(p)
+  function p.transfer(x) return math.max(0, x) end
+  function p.derivative(x) return x > 0 and 1 or 0 end
+  return p
+end
+
+function learn.model.nnet(p)
+  p.n_input = p.n_input or 1
+  p.n_output = p.n_output or 1
+
+  p.criterion = p.criterion or learn.criterion.mse({})
+
+  function p.forward(input)
+    for _, mod in ipairs(p.modules) do
+      input = mod.forward(input)
+    end
+    return input
+  end
+
+  function p.backward(input, gradients)
+    for i = #p.modules, 1, -1 do
+      input, gradients = p.modules[i].backward(input, gradients)
+    end
+  end
+
+  function p.update(input, learning_rate)
+    for i, mod in ipairs(p.modules) do
+      input = mod.update(input, learning_rate)
+    end
+  end
+
+  function p.fit(features, labels, epochs, learning_rate, verbose)
+    local final_error = 1
+
+    p.feature_max, p.label_max = learn.normalize(features), learn.normalize(labels)
+
+    for e = 1, epochs do
+      local error_sum = 0
+
+      for i, input in ipairs(features) do
+        input = learn.tensor({data = input})
+        local target = learn.tensor({data = labels[i]})
+
+        local output = p.forward(input)
+
+        error_sum = error_sum + p.criterion.forward(output, target)
+
+        p.backward(input, p.criterion.backward(output, target))
+        p.update(input, learning_rate)
+      end
+
+      final_error = error_sum / #features
+
+      if verbose and (e % (epochs / 10)) == 0 then
+        print("Error " .. math.floor(final_error / 0.00001) * 0.00001)
+      end
+    end
+
+    return final_error
+  end
+
+  function p.predict(features)
+    local predictions = {}
+
+    for i, feature_vector in ipairs(features) do
+      predictions[i] = p.forward(learn.tensor({data = feature_vector})).data
+    end
+
+    learn.unormalize(predictions, p.label_max)
+
+    return predictions
+  end
+
+  return p
+end
+
+-- Module for linear transformations using a weight tensor
+function learn.layer.linear(p)
+  p.n_input = p.n_input or 1
+  p.n_output = p.n_output or 1
+
+  p.weight_init = p.weight_init or function()
+    return learn.gaussian(0.0, 1.0)
+  end
+
+  p.weights = p.weights or learn.tensor({size = {p.n_output, p.n_input}}).map(p.weight_init)
+  p.gradients = p.gradients or learn.tensor({size = {p.n_output, p.n_input}})
+
+  function p.forward(input)
+    -- print(table.concat(p.weights.data, ", "))
+    p.output = p.weights.dot(input)
+    -- print(table.concat(p.output.data, ", "))
+    return p.output
+  end
+
+  function p.backward(input, gradients)
+    p.delta = gradients.copy().mul(input)
+    return input, p.weights.transpose().dot(p.delta)
+  end
+
+  function p.update(input, learning_rate)
+    p.weights.sub(p.delta.dot(input.transpose()).scale(learning_rate))
+    return p.output
+  end
+
+  return p
+end
+
+-- Helper class for 2D matrix math and such
+function learn.tensor(p)
+  p.data = p.data or {}
+  p.size = p.size or {#p.data, 1}
+
+  function p.set(v, x, y)
+    p.data[x + (y - 1) * p.size[1]] = v
+  end
+
+  function p.get(x, y)
+    return p.data[x + (y - 1) * p.size[1]]
+  end
+
+  function p.copy()
+    return learn.tensor({size = {p.size[1], p.size[2]}}).map(function(v, x, y) return p.get(x, y) end)
+  end
+
+  function p.each(func)
+    for x = 1, p.size[1] do
+      for y = 1, p.size[2] do
+        func(p.get(x, y), x, y)
+      end
+    end
+    return p
+  end
+
+  function p.map(func)
+    return p.each(function(v, x, y) p.set(func(p.get(x, y), x, y), x, y) end)
+  end
+
+  function p.add(b)
+    return p.map(function(v, x, y) return v + b.get(x, y) end)
+  end
+  function p.sub(b)
+    return p.map(function(v, x, y) return v - b.get(x, y) end)
+  end
+  function p.div(b)
+    return p.map(function(v, x, y) return v / b.get(x, y) end)
+  end
+  function p.mul(b)
+    return p.map(function(v, x, y) return v * b.get(x, y) end)
+  end
+  function p.scale(s)
+    return p.map(function(v, x, y) return v * s end)
+  end
+
+  function p.pow(e)
+    return p.map(function(v, x, y) return math.pow(v, e) end)
+  end
+
+  function p.sum(result)
+    result = result or learn.tensor({size = {1, 1}, data = {0}})
+    p.each(function(v) result.data[1] = result.data[1] + v end)
+    return result
+  end
+
+  function p.dot(b, result)
+    assert(p.size[2] == b.size[1], "Invalid dot product tensor size " .. p.size[2] .. " " .. b.size[1])
+
+    if result then
+      result.size[1], result.size[2] = p.size[1], b.size[2]
+    else
+      result = learn.tensor({size = {p.size[1], b.size[2]}})
+    end
+
+    result.map(function(v, x, y)
+      local sum = 0
+      for c = 1, p.size[2] do
+        sum = sum + p.get(x, c) * b.get(c, y)
+      end
+      return sum
+    end)
+
+    return result
+  end
+
+  function p.transpose()
+    local q = p.copy()
+    q.size = {p.size[2], p.size[1]}
+    p.each(function(v, x, y)
+      q.set(p.get(x, y), y, x)
+    end)
+    return q
+  end
+
+  function p.string()
+    local str = ""
+    for x = 1, p.size[1] do
+      for y = 1, p.size[2] do
+        str = str .. (p.get(x, y) or "nil") .. " "
+      end
+      str = str .. "\n"
+    end
+    return str
+  end
+
+  return p
+end
+
+function learn.criterion.mse(p)
+  function p.forward(predictions, target)
+    p.output_tensor = predictions.copy().sub(target).pow(2.0).sum().scale(1.0 / predictions.size[1])
+    p.output = p.output_tensor.data[1]
+    return p.output
+  end
+
+  function p.backward(predictions, target)
+    p.gradInput = predictions.copy().sub(target).scale(2.0 / predictions.size[1])
+    return p.gradInput
+  end
+
+  return p
+end
 
 function learn.normalize(samples)
   local max = 0
